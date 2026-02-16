@@ -74,6 +74,194 @@ if ('serviceWorker' in navigator) {
 // All the logic from the previous version goes here 
 // (indexedDB, rate, audio, sync, etc.)
 // ... 
+
+const { supabase } = window.srsApp;
+let db;
+let unsyncedLocalCount = 0;
+let mediaRecorder;
+let audioChunks = [];
+
+const request = indexedDB.open('FlashcardDB', 1);
+request.onupgradeneeded = (e) => {
+  db = e.target.result;
+  if (!db.objectStoreNames.contains('cards')) db.createObjectStore('cards', { keyPath: 'id' });
+};
+request.onsuccess = (e) => { db = e.target.result; loadDecks(); loadTodayCard(); };
+
+let currentCard = null;
+let currentDeck = 'All';
+const front = document.getElementById('front');
+const back = document.getElementById('back');
+const revealBtn = document.getElementById('revealBtn');
+const audioBtn = document.getElementById('audioBtn');
+const recordBtn = document.getElementById('recordBtn');
+const clearAudioBtn = document.getElementById('clearAudioBtn');
+const actionButtons = document.getElementById('actionButtons');
+const starsDiv = document.getElementById('stars');
+const offlineIcon = document.getElementById('offlineIcon');
+const unsyncedSpan = document.getElementById('unsyncedCount');
+
+function today(){return new Date().toISOString().split('T')[0];}
+function updateSyncDisplay() {
+  offlineIcon.style.display = navigator.onLine ? 'none' : 'block';
+  unsyncedSpan.innerText = unsyncedLocalCount > 0 ? unsyncedLocalCount : '';
+}
+
+async function loadDecks(){
+  if (db) {
+    const tx = db.transaction('cards', 'readonly');
+    const store = tx.objectStore('cards');
+    const req = store.getAll();
+    req.onsuccess = () => updateDeckUI(['All', ...new Set(req.result.map(d=>d.deck||'Default'))]);
+  }
+}
+
+function updateDeckUI(decks) {
+  const sel = document.getElementById('deckSelect');
+  sel.innerHTML='';
+  decks.forEach(d=>{ const opt=document.createElement('option'); opt.value = d; opt.textContent=d; sel.appendChild(opt); });
+}
+
+async function loadTodayCard(){
+  updateSyncDisplay();
+  if (db) {
+    const tx = db.transaction('cards', 'readonly');
+    const store = tx.objectStore('cards');
+    const req = store.getAll();
+    req.onsuccess = () => displayNextCard(req.result);
+  }
+}
+
+function displayNextCard(data) {
+  let filtered = (currentDeck==='All') ? data : data.filter(c=>(c.deck||'Default')===currentDeck);
+  const due = filtered.filter(c=>!c.next_review_date || c.next_review_date<=today());
+  if(due.length===0){
+    front.innerText='No cards due.'; back.style.display='none';
+    revealBtn.style.display = 'none'; actionButtons.classList.add('hidden'); starsDiv.classList.add('hidden');
+    return;
+  }
+  currentCard = due[Math.floor(Math.random()*due.length)];
+  front.innerText=currentCard.english_text;
+  back.style.display='none'; revealBtn.style.display = 'block';
+  actionButtons.classList.add('hidden'); starsDiv.classList.add('hidden');
+}
+
+revealBtn.onclick=()=>{
+  back.innerText=currentCard.ukrainian_text;
+  back.style.display='block'; revealBtn.style.display = 'none';
+  actionButtons.classList.remove('hidden'); 
+  clearAudioBtn.classList.toggle('hidden', !currentCard.audio_base64);
+  showStars();
+};
+
+function showStars(){
+  starsDiv.innerHTML=''; starsDiv.classList.remove('hidden');
+  [1,5,17,43,89].forEach((d,i)=>{
+    const s=document.createElement('span'); s.innerText='🦔'; s.className='star';
+    s.onclick=()=>rate(d,i+1); starsDiv.appendChild(s);
+  });
+}
+
+async function rate(days,level){
+  currentCard.next_review_date = new Date(Date.now() + days*86400000).toISOString().split('T')[0];
+  currentCard.familiarity_level = level;
+  currentCard.last_reviewed_date = new Date().toISOString();
+  const tx = db.transaction('cards', 'readwrite');
+  tx.objectStore('cards').put(currentCard);
+  if (navigator.onLine) await supabase.from('flashcards').upsert(currentCard);
+  else { unsyncedLocalCount++; updateSyncDisplay(); }
+  loadTodayCard();
+}
+
+audioBtn.onclick=()=>{
+  if(currentCard.audio_base64) {
+    const audio = new Audio(currentCard.audio_base64);
+    audio.play();
+  } else {
+    const u=new SpeechSynthesisUtterance(currentCard.ukrainian_text);
+    const voice=speechSynthesis.getVoices().find(v=>v.lang.includes('uk'));
+    if(voice) u.voice=voice;
+    speechSynthesis.speak(u);
+  }
+};
+
+recordBtn.onclick = async () => {
+  if (mediaRecorder && mediaRecorder.state === "recording") {
+    mediaRecorder.stop();
+    return;
+  }
+  
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks = [];
+    
+    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+    mediaRecorder.onstop = async () => {
+      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+      const reader = new FileReader();
+      reader.readAsDataURL(audioBlob);
+      reader.onloadend = async () => {
+        currentCard.audio_base64 = reader.result;
+        const tx = db.transaction('cards', 'readwrite');
+        tx.objectStore('cards').put(currentCard);
+        if (navigator.onLine) await supabase.from('flashcards').upsert(currentCard);
+        else { unsyncedLocalCount++; updateSyncDisplay(); }
+        recordBtn.innerText = "🎤 Record";
+        recordBtn.style.background = "#ef4444";
+        clearAudioBtn.classList.remove('hidden');
+        alert("Recording saved!");
+      };
+    };
+    
+    mediaRecorder.start();
+    recordBtn.innerText = "🛑 Stop";
+    recordBtn.style.background = "#4b5563";
+  } catch (err) {
+    alert("Microphone error: " + err.message);
+  }
+};
+
+clearAudioBtn.onclick = async () => {
+  if(confirm("Clear recording?")) {
+    delete currentCard.audio_base64;
+    const tx = db.transaction('cards', 'readwrite');
+    tx.objectStore('cards').put(currentCard);
+    if (navigator.onLine) await supabase.from('flashcards').upsert(currentCard);
+    clearAudioBtn.classList.add('hidden');
+    alert("Recording cleared. Reverting to computer voice.");
+  }
+};
+
+document.getElementById('syncBtn').onclick = async () => {
+  if (!navigator.onLine) return alert("You must be online to synchronize.");
+  const req = db.transaction('cards', 'readonly').objectStore('cards').getAll();
+  req.onsuccess = async () => {
+    const { error } = await supabase.from('flashcards').upsert(req.result);
+    if (!error) { alert("Sync successful!"); unsyncedLocalCount = 0; updateSyncDisplay(); loadDecks(); loadTodayCard(); }
+  };
+};
+
+document.getElementById('doImport').onclick = async () => {
+  const text = document.getElementById('importText').value.trim();
+  const lines = text.split('\n');
+  let cardsToSave = lines.map(line => {
+    const parts = line.split(',').map(p => p.trim());
+    if(parts.length < 2) return null;
+    return { id: crypto.randomUUID(), english_text: parts[0], ukrainian_text: parts[1], deck: parts[2] || 'Default', familiarity_level: 0, next_review_date: '2000-01-01' };
+  }).filter(c => c !== null);
+  
+  const tx = db.transaction('cards', 'readwrite');
+  cardsToSave.forEach(c => tx.objectStore('cards').put(c));
+  if (navigator.onLine) await supabase.from('flashcards').upsert(cardsToSave);
+  else { unsyncedLocalCount += cardsToSave.length; updateSyncDisplay(); }
+  alert(`Imported ${cardsToSave.length} cards.`);
+  loadDecks(); loadTodayCard();
+};
+
+document.getElementById('importBtn').onclick=()=>document.getElementById('importBox').classList.toggle('hidden');
+document.getElementById('settingsBtn').onclick=()=>document.getElementById('settingsBox').classList.toggle('hidden');
 </script>
 </body>
 </html>
+
